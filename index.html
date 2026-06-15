@@ -641,7 +641,8 @@ const ADMIN_PASS = 'vendor@admin';
 let adminName = '', currentAdminTab = 'dashboard';
 let _vendors = [], _checklist = [], _questions = [], _submissions = [];
 let _vendorSearch='', _vendorStatusFilter='All';
-let _teamMembers = JSON.parse(localStorage.getItem('vp_team_members')||'[]');
+let _teamMembers = []; // loaded from Firestore vpTeamMembers collection
+let _unsubTeam = null;
 let _unsubVendors = null, _unsubChecklist = null, _unsubQuestions = null;
 let _currentVendorToken = null, _vendorData = null;
 let _linkVendorId = null, _reminderVendorId = null;
@@ -686,7 +687,7 @@ function showScreen(id){
 // ══════════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════════
-function doLogin(){
+async function doLogin(){
   const nameVal = (document.getElementById('ln-name').value||'').trim();
   const pass = (document.getElementById('ln-pass').value||'').trim();
   const err = document.getElementById('ln-error');
@@ -694,12 +695,36 @@ function doLogin(){
   if(!pass){err.textContent='Please enter your password.';err.style.display='block';return;}
   err.style.display='none';
 
-  // Check team members
-  const members = JSON.parse(localStorage.getItem('vp_team_members')||'[]');
-  const member = members.find(m=>m.username.toLowerCase()===nameVal.toLowerCase()&&m.password===pass&&m.active);
-  // Check master admin (username must be 'admin', supports password override)
-  const masterPwdOverride = localStorage.getItem('vp_master_pwd_override');
-  const isMasterAdmin = (nameVal.toLowerCase()==='admin') && (pass === ADMIN_PASS || (masterPwdOverride && pass === masterPwdOverride));
+  // Check team members from Firestore (loaded in _teamMembers)
+  // If _teamMembers is empty (page just loaded), fallback fetch from Firestore
+  let member = _teamMembers.find(m=>m.username&&m.username.toLowerCase()===nameVal.toLowerCase()&&m.password===pass&&m.active);
+  if(!member && _teamMembers.length===0){
+    // Fresh load — fetch synchronously
+    try{
+      const snap = await db.collection('vpTeamMembers').where('username','==',nameVal.toLowerCase()).limit(1).get();
+      if(!snap.empty){
+        const m = {_id:snap.docs[0].id,...snap.docs[0].data()};
+        if(m.password===pass&&m.active) member=m;
+      }
+    }catch(e){ console.warn('Team member lookup failed:',e); }
+  }
+  // Always fetch master password fresh from Firestore — never trust localStorage cache
+  let masterPwdOverride = '';
+  try{
+    const settingsDoc = await db.collection('vpSettings').doc('masterAdmin').get();
+    if(settingsDoc.exists) masterPwdOverride = settingsDoc.data().passwordOverride||'';
+    // Update localStorage to reflect latest
+    if(masterPwdOverride) localStorage.setItem('vp_master_pwd_override', masterPwdOverride);
+    else localStorage.removeItem('vp_master_pwd_override');
+  }catch(e){
+    // Offline fallback — use localStorage if Firestore unreachable
+    masterPwdOverride = localStorage.getItem('vp_master_pwd_override')||'';
+  }
+  const isMasterAdmin = (nameVal.toLowerCase()==='admin') && (
+    masterPwdOverride
+      ? pass === masterPwdOverride          // override set — ONLY override works
+      : pass === ADMIN_PASS                 // no override yet — default works
+  );
   if(!member && !isMasterAdmin){
     err.textContent='Invalid username or password. Please try again.';
     err.style.display='block';
@@ -720,6 +745,8 @@ function doLogout(){
   if(_unsubVendors){_unsubVendors();_unsubVendors=null;}
   if(_unsubChecklist){_unsubChecklist();_unsubChecklist=null;}
   if(_unsubQuestions){_unsubQuestions();_unsubQuestions=null;}
+  if(_unsubTeam){_unsubTeam();_unsubTeam=null;}
+  _teamMembers=[];
   _vendors=[];_checklist=[];_questions=[];
   showScreen('loginScreen');
   document.getElementById('ln-name').value='';
@@ -756,6 +783,18 @@ function startAdminListeners(){
       });
     });
   }
+  // ── Team members listener ──
+  if(!_unsubTeam){
+    _unsubTeam = db.collection('vpTeamMembers').onSnapshot(snap=>{
+      _teamMembers = snap.docs.map(d=>({_id:d.id,...d.data()}));
+      if(currentAdminTab==='team') renderAdminTab('team');
+    }, e=>{
+      db.collection('vpTeamMembers').get().then(snap=>{
+        _teamMembers = snap.docs.map(d=>({_id:d.id,...d.data()}));
+      }).catch(()=>{});
+    });
+  }
+
   if(!_unsubQuestions){
     _unsubQuestions = db.collection('vpQuestions').orderBy('createdAt').onSnapshot(snap=>{
       _questions = snap.docs.map(d=>({_id:d.id,...d.data()}));
@@ -2625,7 +2664,7 @@ window.submitVendorOnboarding = async function(){
 // 👥 TEAM ACCESS MANAGEMENT
 // ══════════════════════════════════════════════════
 function renderTeamAccess(){
-  const members = JSON.parse(localStorage.getItem('vp_team_members')||'[]');
+  // _teamMembers is loaded from Firestore in real-time
   return`
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
       <div>
@@ -2635,8 +2674,8 @@ function renderTeamAccess(){
       <button class="btn btn-primary" onclick="openAddMemberModal()">➕ Add Team Member</button>
     </div>
     <div style="background:rgba(27,58,107,.05);border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--text2);line-height:1.8;">
-      <strong>👑 Master Admin:</strong> Login with username = <em>any name</em> · Password = <code>${ADMIN_PASS}</code><br>
-      <strong>Team members</strong> have individual usernames and passwords. Stored securely in this browser.
+      <strong>👑 Master Admin:</strong> Username = <code>admin</code> · Password stored securely in database<br>
+      <strong>Team members</strong> credentials stored in Firebase — changes sync instantly across all devices.
     </div>
     <div class="table-wrap">
       <table>
@@ -2652,7 +2691,7 @@ function renderTeamAccess(){
             <td style="font-size:11px;color:var(--text3);">Built-in</td>
             <td style="text-align:center;font-size:11px;color:var(--text3);">Cannot be removed</td>
           </tr>
-          ${members.map((m,i)=>`<tr>
+          ${_teamMembers.map((m,i)=>`<tr>
             <td style="font-size:11px;color:var(--text3);">${i+1}</td>
             <td style="font-weight:700;">${esc(m.name)}</td>
             <td style="font-family:monospace;font-size:12px;color:var(--accent2);">${esc(m.username)}</td>
@@ -2661,12 +2700,12 @@ function renderTeamAccess(){
             <td>${m.active?'<span class="badge b-approved">✅ Active</span>':'<span class="badge b-rejected">⛔ Inactive</span>'}</td>
             <td style="font-size:11px;color:var(--text3);">${m.addedOn||'—'}</td>
             <td style="text-align:center;white-space:nowrap;">
-              <button class="btn btn-sm" onclick="toggleMember(${i})">${m.active?'⛔ Deactivate':'✅ Activate'}</button>
-              <button class="btn btn-sm" onclick="resetMemberPass(${i})">🔑 Reset</button>
-              <button class="btn btn-sm" style="color:var(--red);" onclick="deleteMember(${i})">🗑</button>
+              <button class="btn btn-sm" onclick="toggleMember('${m._id}')">${m.active?'⛔ Deactivate':'✅ Activate'}</button>
+              <button class="btn btn-sm" onclick="resetMemberPass('${m._id}')">🔑 Reset</button>
+              <button class="btn btn-sm" style="color:var(--red);" onclick="deleteMember('${m._id}')">🗑</button>
             </td>
           </tr>`).join('')}
-          ${!members.length?`<tr><td colspan="8" style="padding:28px;text-align:center;color:var(--text3);">No team members yet. Add members so your team can login with their own credentials.</td></tr>`:''}
+          ${!_teamMembers.length?`<tr><td colspan="8" style="padding:28px;text-align:center;color:var(--text3);">No team members yet. Add members so your team can login with their own credentials.</td></tr>`:''}
         </tbody>
       </table>
     </div>
@@ -2717,7 +2756,7 @@ window.openAddMemberModal = function(){
   setTimeout(()=>document.getElementById('tm-name')?.focus(),100);
 };
 
-window.saveMember = function(){
+window.saveMember = async function(){
   const name=(document.getElementById('tm-name')?.value||'').trim();
   const username=(document.getElementById('tm-username')?.value||'').trim().toLowerCase().replace(/\s+/g,'');
   const role=document.getElementById('tm-role')?.value||'Reviewer';
@@ -2728,41 +2767,50 @@ window.saveMember = function(){
   if(!name||!username||!pass){errEl.textContent='Name, username and password are required.';errEl.style.display='block';return;}
   if(pass.length<6){errEl.textContent='Password must be at least 6 characters.';errEl.style.display='block';return;}
   if(pass!==pass2){errEl.textContent='Passwords do not match.';errEl.style.display='block';return;}
-  const members=JSON.parse(localStorage.getItem('vp_team_members')||'[]');
-  if(members.find(m=>m.username===username)){errEl.textContent='Username already exists. Choose a different username.';errEl.style.display='block';return;}
-  members.push({name,username,role,email,password:pass,active:true,addedOn:new Date().toLocaleDateString('en-IN'),addedBy:adminName});
-  localStorage.setItem('vp_team_members',JSON.stringify(members));
-  toast(`✅ ${name} added as ${role}!`);
-  document.getElementById('addMemberOverlay')?.remove();
-  renderAdminTab('team');
+  // Check username unique in Firestore
+  const existing = await db.collection('vpTeamMembers').where('username','==',username).limit(1).get();
+  if(!existing.empty){errEl.textContent='Username already exists. Choose a different username.';errEl.style.display='block';return;}
+  try{
+    await db.collection('vpTeamMembers').add({
+      name, username, role, email, password:pass,
+      active:true,
+      addedOn:new Date().toLocaleDateString('en-IN'),
+      addedBy:adminName,
+      createdAt:TS()
+    });
+    toast(`✅ ${name} added as ${role}!`);
+    document.getElementById('addMemberOverlay')?.remove();
+    renderAdminTab('team');
+  }catch(e){errEl.textContent='Error: '+e.message;errEl.style.display='block';}
 };
 
-window.toggleMember=function(idx){
-  const members=JSON.parse(localStorage.getItem('vp_team_members')||'[]');
-  if(!members[idx])return;
-  members[idx].active=!members[idx].active;
-  localStorage.setItem('vp_team_members',JSON.stringify(members));
-  toast(members[idx].active?'✅ Activated':'⛔ Deactivated');
-  renderAdminTab('team');
+window.toggleMember=async function(id){
+  const m=_teamMembers.find(x=>x._id===id);
+  if(!m)return;
+  try{
+    await db.collection('vpTeamMembers').doc(id).update({active:!m.active});
+    toast(m.active?'⛔ Member deactivated — they cannot login now':'✅ Member activated');
+  }catch(e){toast('Error: '+e.message);}
 };
 
-window.resetMemberPass=function(idx){
-  const members=JSON.parse(localStorage.getItem('vp_team_members')||'[]');
-  if(!members[idx])return;
-  const newPass=prompt('Set new password for '+members[idx].name+' (min 6 characters):');
+window.resetMemberPass=async function(id){
+  const m=_teamMembers.find(x=>x._id===id);
+  if(!m)return;
+  const newPass=prompt('Set new password for '+m.name+' (min 6 characters):');
   if(!newPass||newPass.length<6){if(newPass!==null)toast('Password must be at least 6 characters.');return;}
-  members[idx].password=newPass;
-  localStorage.setItem('vp_team_members',JSON.stringify(members));
-  toast('✅ Password updated for '+members[idx].name);
+  try{
+    await db.collection('vpTeamMembers').doc(id).update({password:newPass});
+    toast('✅ Password updated for '+m.name+' — takes effect immediately');
+  }catch(e){toast('Error: '+e.message);}
 };
 
-window.deleteMember=function(idx){
-  const members=JSON.parse(localStorage.getItem('vp_team_members')||'[]');
-  if(!confirm('Remove '+members[idx]?.name+' from team access?'))return;
-  members.splice(idx,1);
-  localStorage.setItem('vp_team_members',JSON.stringify(members));
-  toast('🗑 Member removed');
-  renderAdminTab('team');
+window.deleteMember=async function(id){
+  const m=_teamMembers.find(x=>x._id===id);
+  if(!confirm('Remove '+(m?.name||'this member')+' from team access?'))return;
+  try{
+    await db.collection('vpTeamMembers').doc(id).delete();
+    toast('🗑 Member removed');
+  }catch(e){toast('Error: '+e.message);}
 };
 
 // ══════════════════════════════════════════════════
@@ -2808,26 +2856,53 @@ window._cpStrength = function(pwd){
   el.textContent=pwd?'Strength: '+(labels[s]||''):'';
 };
 
-window.saveOwnPassword = function(isMaster){
+window.saveOwnPassword = async function(isMaster){
   const current = document.getElementById('cp-current')?.value||'';
   const newPwd = document.getElementById('cp-new')?.value||'';
-  const confirm = document.getElementById('cp-confirm')?.value||'';
+  const confirmPwd = document.getElementById('cp-confirm')?.value||'';
   const errEl = document.getElementById('cp-err');
   // Verify current password
-  const members = JSON.parse(localStorage.getItem('vp_team_members')||'[]');
-  const me = members.find(m=>m.name===adminName);
-  const currentCorrect = isMaster ? (current===ADMIN_PASS||current===localStorage.getItem('vp_master_pwd_override')) : (me&&me.password===current);
+  const me = _teamMembers.find(m=>m.name===adminName);
+  // Fetch fresh master password from Firestore for verification
+  let masterOverride = '';
+  try{
+    const settingsDoc = await db.collection('vpSettings').doc('masterAdmin').get();
+    if(settingsDoc.exists) masterOverride = settingsDoc.data().passwordOverride||'';
+  }catch(e){
+    masterOverride = localStorage.getItem('vp_master_pwd_override')||'';
+  }
+  const currentCorrect = isMaster
+    ? (masterOverride ? current===masterOverride : current===ADMIN_PASS)
+    : (me && me.password===current);
   if(!currentCorrect){errEl.textContent='Current password is incorrect.';errEl.style.display='block';return;}
   if(newPwd.length<6){errEl.textContent='New password must be at least 6 characters.';errEl.style.display='block';return;}
-  if(newPwd!==confirm){errEl.textContent='Passwords do not match.';errEl.style.display='block';return;}
-  if(isMaster){
-    localStorage.setItem('vp_master_pwd_override', newPwd);
-  } else if(me){
-    me.password = newPwd;
-    localStorage.setItem('vp_team_members', JSON.stringify(members));
+  if(newPwd!==confirmPwd){errEl.textContent='Passwords do not match.';errEl.style.display='block';return;}
+  const btn = document.getElementById('changePwdOverlay')?.querySelector('.btn-primary');
+  if(btn){btn.textContent='Saving…';btn.disabled=true;}
+  try{
+    if(isMaster){
+      // Save master password override to Firestore vpSettings
+      await db.collection('vpSettings').doc('masterAdmin').set({
+        passwordOverride: newPwd,
+        updatedAt: TS(),
+        updatedBy: adminName,
+      }, {merge:true});
+      // Update localStorage immediately so current session uses new password
+      localStorage.setItem('vp_master_pwd_override', newPwd);
+    } else if(me && me._id){
+      // Save team member password to Firestore vpTeamMembers
+      await db.collection('vpTeamMembers').doc(me._id).update({
+        password: newPwd,
+        updatedAt: TS(),
+      });
+    }
+    toast('✅ Password updated — takes effect immediately on all devices');
+    document.getElementById('changePwdOverlay')?.remove();
+  }catch(e){
+    errEl.textContent='Error saving: '+e.message;
+    errEl.style.display='block';
+    if(btn){btn.textContent='💾 Update Password';btn.disabled=false;}
   }
-  toast('✅ Password updated successfully!');
-  document.getElementById('changePwdOverlay')?.remove();
 };
 
 // ══════════════════════════════════════════════════
